@@ -112,6 +112,103 @@ func AllocateAndReleaseAddressesTest(ipVersion string, ipRange string, ipGateway
 	}
 }
 
+func AllocateUntilExhaustionTest(ipVersion string, ipRange string, ipGateway string, expectedAddresses []string, datastore string) {
+	const ifname string = "eth0"
+	const nspath string = "/some/where"
+
+	var backend string
+	var store string
+	if datastore == whereaboutstypes.DatastoreKubernetes {
+		backend = fmt.Sprintf(`"kubernetes": {"kubeconfig": "%s"}`, kubeConfigPath)
+		store = datastore
+	} else {
+		backend = fmt.Sprintf(`"etcd_host": "%s"`, etcdHost)
+		store = whereaboutstypes.DatastoreETCD
+	}
+
+	conf := fmt.Sprintf(`{
+		"cniVersion": "0.3.1",
+		"name": "mynet",
+		"type": "ipvlan",
+		"master": "foo0",
+		"ipam": {
+		  "type": "whereabouts",
+		  "datastore": "%s",
+		  "log_file" : "/tmp/whereabouts.log",
+				  "log_level" : "debug",
+		  %s,
+		  "range": "%s",
+		  "gateway": "%s",
+		  "routes": [
+			{ "dst": "0.0.0.0/0" }
+		  ]
+		}
+	  }`, store, backend, ipRange, ipGateway)
+
+	addressArgs := []*skel.CmdArgs{}
+
+	for i := 0; i < len(expectedAddresses); i++ {
+		args := &skel.CmdArgs{
+			ContainerID: fmt.Sprintf("dummy-%d", i),
+			Netns:       nspath,
+			IfName:      ifname,
+			StdinData:   []byte(conf),
+		}
+
+		// Allocate the IP
+		r, raw, err := testutils.CmdAddWithArgs(args, func() error {
+			return cmdAdd(args)
+		})
+		Expect(err).NotTo(HaveOccurred())
+		// fmt.Printf("!bang raw: %s\n", raw)
+		Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+
+		result, err := current.GetResult(r)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Gomega is cranky about slices with different caps
+		Expect(*result.IPs[0]).To(Equal(
+			current.IPConfig{
+				Version: ipVersion,
+				Address: mustCIDR(expectedAddresses[i]),
+				Gateway: net.ParseIP(ipGateway),
+			}))
+
+		// Release the IP
+		err = testutils.CmdDelWithArgs(args, func() error {
+			return cmdDel(args)
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Now, create the same thing again, and expect the same IP
+		// That way we know it dealloced the IP and assigned it again.
+		r, _, err = testutils.CmdAddWithArgs(args, func() error {
+			return cmdAdd(args)
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err = current.GetResult(r)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(*result.IPs[0]).To(Equal(
+			current.IPConfig{
+				Version: ipVersion,
+				Address: mustCIDR(expectedAddresses[i]),
+				Gateway: net.ParseIP(ipGateway),
+			}))
+
+		addressArgs = append(addressArgs, args)
+	}
+
+	for _, args := range addressArgs {
+		// And we'll release the IP again.
+		err := testutils.CmdDelWithArgs(args, func() error {
+			return cmdDel(args)
+		})
+		Expect(err).NotTo(HaveOccurred())
+	}
+}
+
 var _ = Describe("Whereabouts operations", func() {
 	It("allocates and releases addresses on ADD/DEL", func() {
 		ipVersion := "4"
@@ -362,6 +459,19 @@ var _ = Describe("Whereabouts operations", func() {
 			return cmdDel(args)
 		})
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("can exhaust a range", func() {
+
+		ipVersion := "4"
+		ipRange := "192.168.1.0/24"
+		ipGateway := "192.168.10.1"
+		expectedAddress := "192.168.1.1/24"
+
+		for i := 1; i <= 255; i++ {
+			AllocateAndReleaseAddressesTest(ipVersion, ipRange, ipGateway, []string{expectedAddress}, whereaboutstypes.DatastoreETCD)
+		}
+
 	})
 
 	It("allocates an address using the range_start parameter", func() {
